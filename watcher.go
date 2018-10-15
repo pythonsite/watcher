@@ -1,6 +1,7 @@
 package watcher
 
 import (
+	"time"
 	"strings"
 	"path/filepath"
 	"errors"
@@ -152,21 +153,24 @@ func (w *Watcher) Add(name string) (err error) {
 func (w *Watcher) list(name string) (map[string]os.FileInfo, error) {
 	fileList := make(map[string]os.FileInfo)
 
+	// 确认文件是否存在
 	stat, err := os.Stat(name)
 	if err != nil {
 		return nil, err
 	}
 
 	fileList[name] = stat
+	// 如果不是一个目录的话直接返回
 	if !stat.IsDir() {
 		return fileList, nil
 	}
-
+	// 如果是一个目录按照下面处理
 	fInfoList, err := ioutil.ReadDir(name)
 	if err != nil {
 		return nil, err
 	}
 
+	// 循环将在这个目录下的所有文件添加到 file list,当然这些文件不能是在要忽略的列表或者ignoreHidden设置为true
 	for _, fInfo := range fInfoList {
 		path := filepath.Join(name, fInfo.Name())
 		_, ignored := w.ignored[path]
@@ -218,6 +222,329 @@ func (w *Watcher) listRecursive(name string) (map[string]os.FileInfo, error) {
 		return nil
 	})
 }
+
+func (w *Watcher) Remove(name string) (err error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	name, err = filepath.Abs(name)
+	if err != nil {
+		return err
+	}
+
+	delete(w.names, name)
+
+	info, found := w.files[name]
+	if !found {
+		return nil
+	}
+	if !info.IsDir() {
+		delete(w.files, name)
+		return nil
+	}
+
+	delete(w.files, name)
+
+	for path := range w.files {
+		if filepath.Dir(path) == name {
+			delete(w.files, path)
+		}
+	}
+	return nil
+}
+
+func (w *Watcher) RemoveRecursive(name string) (err error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	name, err = filepath.Abs(name)
+	if err!= nil {
+		return err
+	}
+
+	delete(w.names, name)
+
+	info, found := w.files[name]
+	if !found {
+		return nil
+	}
+
+	if !info.IsDir() {
+		delete(w.files,name)
+		return nil
+	}
+
+	for path := range w.files {
+		if strings.HasPrefix(path, name) {
+			delete(w.files, path)
+		}
+	}
+	return nil
+
+}
+
+func (w *Watcher) Ignore(paths ...string) (err error) {
+	for _, path := range paths {
+		path, err = filepath.Abs(path)
+		if err != nil {
+			return err
+		}
+		if err := w.RemoveRecursive(path); err != nil {
+			return err
+		}
+		w.mu.Lock()
+		w.ignored[path] = struct{}{}
+		w.mu.Unlock()
+	}
+	return nil
+}
+
+func (w *Watcher) WatchedFiles() map[string]os.FileInfo {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	return w.files
+}
+
+type fileInfo struct {
+	name 		string
+	size 		int64
+	mode 		os.FileMode
+	modTime	 	time.Time
+	sys			interface{}
+	dir 		bool
+}
+
+func (fs *fileInfo) IsDir() bool {
+	return fs.dir
+}
+
+func (fs *fileInfo) ModTime() time.Time {
+	return fs.modTime
+}
+
+func (fs *fileInfo) Mode() os.FileMode {
+	return fs.mode
+}
+
+func (fs *fileInfo) Name() string {
+	return fs.name
+}
+
+func (fs *fileInfo) Size() int64 {
+	return fs.size
+}
+
+func (fs *fileInfo) Sys() interface{} {
+	return fs.sys
+}
+
+func (w *Watcher) TriggerEvent(eventType Op, file os.FileInfo) {
+	w.Wait()
+	if file == nil {
+		file = &fileInfo{name: "triggered event", modTime: time.Now()}
+	}
+	w.Event <- Event{Op: eventType, Path: "-", FileInfo: file}
+}
+
+func(w *Watcher) retrieveFileList() map[string]os.FileInfo {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	fileList := make(map[string]os.FileInfo)
+	var list map[string]os.FileInfo
+	var err error
+	for name, recursive := range w.names {
+		if recursive {
+			list , err = w.listRecursive(name)
+			if err != nil {
+				if os.IsNotExist(err) {
+					w.Error <- ErrWatchedFileDeleted
+					w.mu.Unlock()
+					w.RemoveRecursive(name)
+					w.mu.Lock()
+				} else {
+					w.Error <- err
+				}
+			}
+		} else {
+			list ,err = w.list(name)
+			if err != nil {
+				if os.IsNotExist(err) {
+					w.Error <- ErrWatchedFileDeleted
+					w.mu.Unlock()
+					w.Remove(name)
+					w.mu.Lock()
+
+				} else {
+					w.Error <- err
+				}
+			}
+		}
+		for k,v := range list {
+			fileList[k] = v
+		}
+	}
+	return fileList
+}
+
+func (w *Watcher) Start(d time.Duration) error {
+	if d < time.Nanosecond {
+		return ErrDurationTooShort
+	}
+	w.mu.Lock()
+	if w.runnning {
+		w.mu.Unlock()
+		return ErrWatcherRunning
+	}
+	w.runnning = true
+	w.mu.Unlock()
+	w.wg.Done()
+
+	for {
+		done := make(chan struct{})
+
+		evt := make(chan Event)
+
+		fileList := w.retrieveFileList()
+
+		cancel := make(chan struct{})
+
+		go func() {
+			done <- struct{}{}
+		}()
+		
+		numEvents := 0
+	inner:
+		for {
+			select {
+			case <- w.close:
+				close(cancel)
+				close(w.Closed)
+				return nil
+			case event := <-evt:
+				if len(w.ops) >0 {
+					_, found := w.ops[event.Op]
+					if !found {
+						continue
+					}
+				}
+				numEvents++
+				if w.maxEvents >0 && numEvents > w.maxEvents {
+					close(cancel)
+					break inner
+				}
+				w.Event <- event
+			case <- done:
+				break inner
+			}
+
+		}
+		w.mu.Lock()
+		w.files = fileList
+		w.mu.Unlock()
+
+		time.Sleep(d)
+	}
+}
+
+func (w *Watcher) pollEvents(files map[string]os.FileInfo, evt chan Event,cancel chan struct{}) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	creates := make(map[string]os.FileInfo)
+	removes := make(map[string]os.FileInfo)
+
+	for path, info := range w.files {
+		if _, found := files[path]; !found {
+			removes[path] = info
+		}
+	}
+
+	for path, info := range files {
+		oldInfo, found := w.files[path]
+		if !found {
+			creates[path] = info
+			continue
+		}
+		if oldInfo.ModTime() != info.ModTime() {
+			select {
+			case <- cancel:
+				return
+			case evt <- Event{Write, path, info}:
+
+			}
+		}
+
+		if oldInfo.Mode() != info.Mode() {
+			select {
+			case <- cancel:
+				return
+			case evt <- Event{Chmod, path, info}:
+			}
+		}
+	}
+	for path1, info1 := range removes {
+		for path2, info2 := range creates {
+			if sameFile(info1, info2) {
+				e := Event {
+					Op:		Move,
+					Path:	fmt.Sprintf("%s -> %s", path1, path2),
+					FileInfo: info1,
+				}
+				if filepath.Dir(path1) == filepath.Dir(path2) {
+					e.Op = Rename
+				}
+				delete(removes, path1)
+				delete(creates, path2)
+
+				select {
+				case <- cancel:
+					return
+				case evt <- e:
+
+				}
+			}
+		}
+	}
+
+	for path, info := range creates {
+		select {
+		case <- cancel:
+			return
+		case evt <- Event{Create, path, info}:
+
+		}
+	}
+
+	for path, info := range removes {
+		select {
+		case <- cancel:
+			return
+		case evt <- Event{Remove, path, info}:
+		}
+	}
+
+}
+
+func (w *Watcher) Wait() {
+	w.wg.Wait()
+}
+
+func (w *Watcher) Close() {
+	w.mu.Lock()
+	if !w.runnning {
+		w.mu.Unlock()
+		return
+	}
+	w.runnning = false
+	w.files = make(map[string]os.FileInfo)
+	w.names = make(map[string]bool)
+	w.mu.Unlock()
+
+	w.close <- struct{}{}
+}
+
+
 
 
 
