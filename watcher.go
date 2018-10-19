@@ -49,7 +49,7 @@ func (e Op) String() string {
 }
 
 type Event struct {
-	Op,
+	Op
 	Path string
 	os.FileInfo
 }
@@ -182,6 +182,7 @@ func (w *Watcher) list(name string) (map[string]os.FileInfo, error) {
 	return fileList, nil
 }
 
+// 递归添加一个文件或者目录下的文件到file list
 func (w *Watcher) AddRecursive(name string) (err error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -223,6 +224,7 @@ func (w *Watcher) listRecursive(name string) (map[string]os.FileInfo, error) {
 	})
 }
 
+// 从file list 中删除一个文件或者目录
 func (w *Watcher) Remove(name string) (err error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -232,8 +234,10 @@ func (w *Watcher) Remove(name string) (err error) {
 		return err
 	}
 
+	// 从w.names中删除一个name
 	delete(w.names, name)
 
+	// 如果name 是一个文件，则从files中删除
 	info, found := w.files[name]
 	if !found {
 		return nil
@@ -243,8 +247,10 @@ func (w *Watcher) Remove(name string) (err error) {
 		return nil
 	}
 
+	// 删除目录从w.files中
 	delete(w.files, name)
 
+	// 如果是一个目录则删除它包含的所有内容从files中
 	for path := range w.files {
 		if filepath.Dir(path) == name {
 			delete(w.files, path)
@@ -253,6 +259,7 @@ func (w *Watcher) Remove(name string) (err error) {
 	return nil
 }
 
+// 从文件列表中递归删除单个文件或者目录
 func (w *Watcher) RemoveRecursive(name string) (err error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -261,9 +268,10 @@ func (w *Watcher) RemoveRecursive(name string) (err error) {
 	if err!= nil {
 		return err
 	}
-
+	// 从names list中删除指定name
 	delete(w.names, name)
 
+	// 如果name是一个单个文件，删除它并且return
 	info, found := w.files[name]
 	if !found {
 		return nil
@@ -273,7 +281,7 @@ func (w *Watcher) RemoveRecursive(name string) (err error) {
 		delete(w.files,name)
 		return nil
 	}
-
+	// 如果是一个目录， 删除所有的以及递归删除它包含的从w.files
 	for path := range w.files {
 		if strings.HasPrefix(path, name) {
 			delete(w.files, path)
@@ -283,12 +291,15 @@ func (w *Watcher) RemoveRecursive(name string) (err error) {
 
 }
 
+// 添加要忽略的路径
+// 将已经添加到files中的，忽略移除他们
 func (w *Watcher) Ignore(paths ...string) (err error) {
 	for _, path := range paths {
 		path, err = filepath.Abs(path)
 		if err != nil {
 			return err
 		}
+		// 地推的删除所有我们添加的
 		if err := w.RemoveRecursive(path); err != nil {
 			return err
 		}
@@ -299,6 +310,7 @@ func (w *Watcher) Ignore(paths ...string) (err error) {
 	return nil
 }
 
+// 返回一个files map 
 func (w *Watcher) WatchedFiles() map[string]os.FileInfo {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -339,6 +351,7 @@ func (fs *fileInfo) Sys() interface{} {
 	return fs.sys
 }
 
+// TriggerEvent 是一个用来触发事件的方法，与文件watching 进程是分开的
 func (w *Watcher) TriggerEvent(eventType Op, file os.FileInfo) {
 	w.Wait()
 	if file == nil {
@@ -486,9 +499,9 @@ func (w *Watcher) pollEvents(files map[string]os.FileInfo, evt chan Event,cancel
 	for path1, info1 := range removes {
 		for path2, info2 := range creates {
 			if sameFile(info1, info2) {
-				e := Event {
+				e := Event{
 					Op:		Move,
-					Path:	fmt.Sprintf("%s -> %s", path1, path2),
+					Path:	fmt.Sprintf("%s -> %s", path1, path2),
 					FileInfo: info1,
 				}
 				if filepath.Dir(path1) == filepath.Dir(path2) {
